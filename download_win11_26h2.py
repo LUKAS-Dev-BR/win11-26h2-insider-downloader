@@ -4,59 +4,62 @@ download_win11_26h2.py
 ======================
 
 Baixa a ISO do Windows 11 26H2 (build 26300.x) diretamente do
-Windows Insider Program usando cookies de sessão exportados do browser.
+**Windows Insider Program** automatizando o browser com Playwright.
 
-Uso:
-    # 1) Faça login em https://www.microsoft.com/en-us/software-download/windows-insider
-    # 2) Exporte os cookies no formato Netscape (extensão "Get cookies.txt LOCALLY")
-    #    para o arquivo cookies.txt
-    # 3) Rode:
-    python3 download_win11_26h2.py --cookies cookies.txt --output ./win11_26h2.iso
+Fluxo:
+  1. Abre o Chromium (headed por padrão na primeira vez).
+  2. Vai na página do Insider e, se você não estiver logado, **espera
+     você fazer login manualmente** (lida com 2FA/MFA certinho).
+  3. Salva o estado de autenticação num arquivo (`storage_state.json`)
+     pra você não precisar logar de novo nas próximas vezes.
+  4. Preenche automaticamente canal / idioma / arquitetura.
+  5. Clica em "Download", captura a URL gerada e baixa a ISO com
+     barra de progresso.
+  6. (Opcional) Valida o SHA-256.
 
-Aviso: este script existe porque a Microsoft ainda não expôs a 26H2 na
-página pública de download. A página Insider exige conta inscrita no
-programa + cookies válidos (geralmente ~15 min de vida útil).
+Não precisa de extensão nenhuma.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
-import os
 import re
 import sys
 import time
-from http.cookiejar import MozillaCookieJar
 from pathlib import Path
 from typing import Optional
 
 import requests
+from playwright.sync_api import (
+    Browser,
+    BrowserContext,
+    Page,
+    Playwright,
+    TimeoutError as PlaywrightTimeout,
+    sync_playwright,
+)
 from tqdm import tqdm
 
 
-INSIDER_PAGE = "https://www.microsoft.com/en-us/software-download/windows-insider"
-EXPECTED_BUILD_RE = re.compile(r"Build\s*(\d{2,6}\.\d{2,6})", re.IGNORECASE)
-ISO_LINK_RE = re.compile(
-    r"https?://[^\"'<>]+\.(?:iso|img|vhdx)[^\"'<>]*",
-    re.IGNORECASE,
-)
+INSIDER_URL = "https://www.microsoft.com/en-us/software-download/windows-insider"
+DEFAULT_STATE = Path("storage_state.json")
+DEFAULT_OUTPUT = Path("./Windows11_26H2.iso")
+
+# Timeout pra esperar o login manual (5 min)
+LOGIN_TIMEOUT_MS = 5 * 60 * 1000
+
+# Mensagens de UI conhecidas
+ACCEPT_TERMS_PATTERNS = [
+    re.compile(r"\bi\s+accept\b", re.IGNORECASE),
+    re.compile(r"\bi\s+agree\b", re.IGNORECASE),
+    re.compile(r"\baceito\b", re.IGNORECASE),
+]
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Baixa a ISO do Windows 11 26H2 via Insider Program."
-    )
-    p.add_argument(
-        "--cookies",
-        type=Path,
-        required=True,
-        help="Caminho para o arquivo de cookies Netscape exportado do browser.",
-    )
-    p.add_argument(
-        "--output",
-        type=Path,
-        default=Path("./Windows11_26H2.iso"),
-        help="Caminho de saída para a ISO (padrão: ./Windows11_26H2.iso).",
+        description="Baixa a ISO do Windows 11 26H2 via Windows Insider Program."
     )
     p.add_argument(
         "--channel",
@@ -67,114 +70,242 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--language",
         default="English (United States)",
-        help="Idioma da ISO.",
+        help="Idioma da ISO (ex: 'Portuguese (Brazil)').",
+    )
+    p.add_argument(
+        "--arch",
+        choices=["x64", "Arm64"],
+        default="x64",
+        help="Arquitetura (padrão: x64).",
+    )
+    p.add_argument(
+        "--output",
+        type=Path,
+        default=DEFAULT_OUTPUT,
+        help="Caminho de saída da ISO.",
+    )
+    p.add_argument(
+        "--state",
+        type=Path,
+        default=DEFAULT_STATE,
+        help="Arquivo de storage_state do Playwright (cookies + localStorage).",
+    )
+    p.add_argument(
+        "--headless",
+        action="store_true",
+        help="Roda o browser sem janela. Só funciona se --state já existe.",
+    )
+    p.add_argument(
+        "--url-only",
+        action="store_true",
+        help="Apenas captura a URL de download gerada, sem baixar a ISO.",
     )
     p.add_argument(
         "--sha256",
         default=None,
-        help="SHA-256 esperado (opcional). Se informado, valida após download.",
+        help="SHA-256 esperado. Se informado, valida após o download.",
     )
     p.add_argument(
-        "--no-download",
+        "--reset-state",
         action="store_true",
-        help="Apenas resolve a URL de download sem baixar o arquivo.",
+        help="Apaga o storage_state salvo e força novo login interativo.",
+    )
+    p.add_argument(
+        "--debug-dir",
+        type=Path,
+        default=Path("./debug"),
+        help="Diretório pra screenshots e HTML em caso de erro.",
     )
     return p.parse_args()
 
 
-def load_cookies(path: Path) -> requests.Session:
-    if not path.exists():
-        sys.exit(f"[erro] arquivo de cookies não encontrado: {path}")
+# --------------------------------------------------------------------------- #
+# Helpers de Playwright
+# --------------------------------------------------------------------------- #
 
-    jar = MozillaCookieJar(str(path))
+
+def find_select_by_label(page: Page, label_text: str):
+    """Retorna o <select> cujo rótulo próximo contém `label_text`."""
+    return page.locator(
+        f"select:near(:text('{label_text}'))"
+    ).first
+
+
+def dump_debug(page: Page, dest: Path, tag: str) -> None:
+    """Salva screenshot e HTML pra debug quando algo dá errado."""
+    dest.mkdir(parents=True, exist_ok=True)
     try:
-        jar.load(ignore_discard=True, ignore_expires=True)
+        page.screenshot(path=str(dest / f"{tag}.png"), full_page=True)
+        (dest / f"{tag}.html").write_text(page.content(), encoding="utf-8")
     except Exception as exc:
-        sys.exit(f"[erro] falhei ao ler cookies Netscape: {exc}")
+        print(f"[warn] não consegui salvar debug em {tag}: {exc}")
 
-    session = requests.Session()
-    session.cookies = jar
-    session.headers.update(
-        {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/130.0.0.0 Safari/537.36"
-            ),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-        }
+
+def is_logged_in(page: Page) -> bool:
+    """Heurística: na página Insider logada, aparecem dropdowns de produto."""
+    try:
+        # Procura qualquer <select> visível na página
+        return page.locator("select").count() > 0
+    except Exception:
+        return False
+
+
+def wait_for_login(page: Page, timeout_ms: int = LOGIN_TIMEOUT_MS) -> None:
+    """Espera o usuário terminar o login (lidando com 2FA)."""
+    print("\n" + "=" * 70)
+    print("  AÇÃO NECESSÁRIA: faça login com sua conta Microsoft Insider")
+    print("  (pode levar 2FA / Microsoft Authenticator — faça tudo no browser)")
+    print("=" * 70 + "\n")
+
+    # Espera a URL sair dos domínios de login
+    page.wait_for_function(
+        """() => {
+            const u = window.location.href.toLowerCase();
+            return !u.includes('login.live.com')
+                && !u.includes('login.microsoftonline.com')
+                && !u.includes('account.microsoft.com');
+        }""",
+        timeout=timeout_ms,
     )
-    return session
+
+    # Espera os controles do formulário de download aparecerem
+    page.wait_for_selector("select", timeout=timeout_ms)
+    print("[ok] Login concluído e formulário detectado.")
 
 
-def check_session(session: requests.Session) -> None:
-    """Confere se os cookies ainda estão válidos."""
-    print("[*] Validando sessão Microsoft…")
-    r = session.get(INSIDER_PAGE, allow_redirects=True, timeout=30)
-    if "Sign in" in r.text and "login.live.com" in r.text.lower():
-        sys.exit(
-            "[erro] Cookies expiraram ou conta não está inscrita no Insider.\n"
-            "       Refaça login em " + INSIDER_PAGE + " e reexporte os cookies."
-        )
-    if r.status_code != 200:
-        sys.exit(f"[erro] Resposta inesperada ({r.status_code}) da página Insider.")
-    print("[ok] Sessão válida.")
+def accept_terms_if_present(page: Page) -> None:
+    """Marca checkbox/aceite de termos se existir."""
+    for pattern in ACCEPT_TERMS_PATTERNS:
+        try:
+            box = page.locator(
+                f"input[type='checkbox']:near(:text(\"{pattern.pattern}\"))"
+            ).first
+            if box.count() > 0 and not box.is_checked():
+                box.check()
+                print(f"[ok] Aceite de termos marcado: {pattern.pattern!r}")
+        except Exception:
+            pass
 
 
-def extract_iso_link(html: str) -> Optional[str]:
-    """Procura a URL da ISO na página renderizada."""
-    candidates = ISO_LINK_RE.findall(html)
-    if not candidates:
-        return None
-    # A Microsoft geralmente serve via software-download.akamaized.net ou
-    # download.microsoft.com — filtrar pelos hosts esperados.
-    preferred = [
-        u for u in candidates
-        if any(host in u.lower() for host in (
-            "software-download",
-            "download.microsoft",
-            "vlscppe.microsoft",
-            "akamaized.net",
-        ))
-    ]
-    return preferred[0] if preferred else candidates[0]
+# --------------------------------------------------------------------------- #
+# Fluxo principal: preencher formulário e pegar URL
+# --------------------------------------------------------------------------- #
 
 
-def fetch_iso_url(session: requests.Session, channel: str, language: str) -> tuple[str, str]:
-    """Aciona o fluxo JavaScript manualmente (simplificado) para pegar a URL.
+def fill_form(page: Page, channel: str, language: str, arch: str) -> None:
+    """Seleciona canal/edição, idioma e arquitetura nos dropdowns."""
+    print(f"[*] Preenchendo formulário: canal={channel!r}, idioma={language!r}, arch={arch!r}")
 
-    A página usa controles webforms com __VIEWSTATE. Esta implementação
-    faz fallback para raspagem direta da página renderizada.
-    """
-    print(f"[*] Buscando ISO no canal '{channel}', idioma '{language}'…")
-    r = session.get(INSIDER_PAGE, timeout=60)
-    r.raise_for_status()
+    # Espera a página ter pelo menos um <select>
+    page.wait_for_selector("select", timeout=60_000)
 
-    url = extract_iso_link(r.text)
-    if not url:
-        # Salva HTML para debug
-        debug_path = Path("insider_page_debug.html")
-        debug_path.write_text(r.text, encoding="utf-8", errors="ignore")
-        sys.exit(
-            f"[erro] Não achei link de ISO na página. HTML salvo em {debug_path}.\n"
-            "       Pode ser que a Microsoft tenha mudado o layout ou que\n"
-            "       o canal/idioma selecionado não tenha 26H2 ainda."
-        )
+    selects = page.locator("select")
+    n = selects.count()
+    print(f"[*] {n} <select>(s) encontrados na página.")
 
-    build_match = EXPECTED_BUILD_RE.search(r.text)
-    build = build_match.group(1) if build_match else "desconhecido"
-    print(f"[ok] Build detectado: {build}")
-    print(f"[ok] URL da ISO: {url}")
-    return url, build
+    if n == 0:
+        raise RuntimeError("Nenhum <select> encontrado. A página pode ter mudado.")
+
+    # Tenta casar cada dropdown por heurística de label próximo
+    def try_select(label_re: str, target_label: str, kind: str) -> bool:
+        for i in range(n):
+            sel = selects.nth(i)
+            try:
+                # Texto de label associado (heurística: label/legend/spans próximos)
+                surrounding = sel.evaluate(
+                    """el => {
+                        const ids = [el.id, el.name];
+                        const labels = Array.from(document.querySelectorAll('label'))
+                            .filter(l => l.htmlFor && ids.includes(l.htmlFor))
+                            .map(l => l.textContent);
+                        return (labels.join(' ') + ' ' + (el.getAttribute('aria-label') || '')).toLowerCase();
+                    }"""
+                )
+                if label_re.lower() in surrounding:
+                    sel.select_option(label=target_label)
+                    print(f"[ok] {kind}: {target_label!r}")
+                    return True
+            except Exception:
+                continue
+        return False
+
+    # 1) Canal (Edition) — em algumas builds aparece como radio, em outras como select
+    if not try_select("edition", channel, "Edition"):
+        # Tenta por valor exato também
+        try_select("channel", channel, "Channel")
+
+    # Pequena pausa pra AJAX repopular listas dependentes
+    page.wait_for_timeout(1500)
+
+    # Re-busca selects (podem ter sido recriados)
+    selects = page.locator("select")
+
+    # 2) Idioma
+    try_select("language", language, "Language")
+    page.wait_for_timeout(1000)
+
+    # 3) Arquitetura
+    try_select("architecture", arch, "Architecture")
+    page.wait_for_timeout(1000)
 
 
-def download_file(url: str, dest: Path, session: requests.Session) -> None:
-    print(f"[*] Baixando para {dest}…")
-    with session.get(url, stream=True, timeout=60, allow_redirects=True) as r:
+def click_download_and_capture_url(page: Page, debug_dir: Path) -> str:
+    """Clica no botão Download e captura a URL gerada."""
+    print("[*] Clicando em Download…")
+
+    # A Microsoft exibe a URL num <input readonly> ou como texto na página
+    # após o clique. Vamos esperar pelo link aparecer.
+
+    download_btn = page.locator(
+        "button:has-text('Download'), input[type='submit'][value*='Download'], a:has-text('Download')"
+    ).first
+
+    if download_btn.count() == 0:
+        dump_debug(page, debug_dir, "no_download_button")
+        raise RuntimeError("Botão de Download não encontrado.")
+
+    with page.expect_navigation(wait_until="domcontentloaded", timeout=120_000):
+        try:
+            download_btn.click()
+        except PlaywrightTimeout:
+            # Alguns fluxos não navegam — só trocam o conteúdo
+            pass
+
+    # Espera a URL aparecer no HTML
+    print("[*] Esperando URL de download ser gerada…")
+    url_re = re.compile(r"https?://[^\"'<>]+\.(?:iso|img|vhdx)[^\"'<>]*", re.IGNORECASE)
+    deadline = time.time() + 180
+    last_html = ""
+    while time.time() < deadline:
+        html = page.content()
+        if html != last_html:
+            last_html = html
+        m = url_re.search(html)
+        if m:
+            url = m.group(0)
+            print(f"[ok] URL capturada: {url}")
+            return url
+        page.wait_for_timeout(2000)
+
+    dump_debug(page, debug_dir, "no_download_url")
+    raise RuntimeError(
+        "URL de download não apareceu após o clique. "
+        f"Veja screenshots em {debug_dir}/."
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Download em si (com progresso)
+# --------------------------------------------------------------------------- #
+
+
+def download_iso(url: str, dest: Path) -> None:
+    print(f"[*] Baixando ISO para {dest}…")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    with requests.get(url, stream=True, timeout=60, allow_redirects=True) as r:
         r.raise_for_status()
         total = int(r.headers.get("Content-Length", 0))
-        dest.parent.mkdir(parents=True, exist_ok=True)
         with open(dest, "wb") as f, tqdm(
             total=total,
             unit="B",
@@ -198,42 +329,91 @@ def sha256_of(path: Path) -> str:
     return h.hexdigest()
 
 
+# --------------------------------------------------------------------------- #
+# Orquestração
+# --------------------------------------------------------------------------- #
+
+
+def build_context(p: Playwright, headless: bool, state_path: Path) -> BrowserContext:
+    """Cria BrowserContext, carregando state salvo se existir."""
+    browser: Browser = p.chromium.launch(headless=headless)
+    if state_path.exists():
+        ctx = browser.new_context(storage_state=str(state_path))
+        print(f"[ok] storage_state carregado de {state_path}")
+    else:
+        ctx = browser.new_context()
+    return ctx
+
+
 def main() -> int:
     args = parse_args()
-    session = load_cookies(args.cookies)
-    check_session(session)
 
-    iso_url, build = fetch_iso_url(args.channel, args.language)
+    if args.reset_state and args.state.exists():
+        args.state.unlink()
+        print(f"[ok] {args.state} apagado — novo login será necessário.")
 
-    if args.no_download:
-        print(f"[skip] --no-download setado. URL final: {iso_url}")
-        return 0
+    if args.headless and not args.state.exists():
+        print(
+            "[erro] --headless exige um storage_state existente.\n"
+            "       Rode primeiro sem --headless pra fazer login uma vez."
+        )
+        return 2
 
-    started = time.time()
-    download_file(iso_url, args.output, session)
-    elapsed = time.time() - started
-    print(f"[*] Tempo total: {elapsed/60:.1f} min")
+    with sync_playwright() as p:
+        # headless só é seguro se já temos state salvo
+        ctx = build_context(p, headless=args.headless, state_path=args.state)
+        page: Page = ctx.new_page()
 
-    actual = sha256_of(args.output)
-    print(f"[ok] SHA-256: {actual}")
+        try:
+            page.goto(INSIDER_URL, wait_until="domcontentloaded", timeout=60_000)
 
-    if args.sha256:
-        if actual.lower() == args.sha256.lower():
-            print("[ok] Hash confere — ISO íntegra.")
+            if not is_logged_in(page):
+                if args.headless:
+                    dump_debug(page, args.debug_dir, "not_logged_in_headless")
+                    print("[erro] Não autenticado. Rode sem --headless primeiro.")
+                    return 3
+                wait_for_login(page)
+
+                # Salva estado pra próximas execuções
+                ctx.storage_state(path=str(args.state))
+                print(f"[ok] Estado salvo em {args.state} (próximas runs não precisam de login).")
+
+            accept_terms_if_present(page)
+            fill_form(page, args.channel, args.language, args.arch)
+
+            iso_url = click_download_and_capture_url(page, args.debug_dir)
+
+            # Re-salva estado (login + seleções podem mudar storage)
+            ctx.storage_state(path=str(args.state))
+
+            if args.url_only:
+                print(f"\n[URL de download (válida por tempo limitado)]\n{iso_url}\n")
+                return 0
+
+            download_iso(iso_url, args.output)
+            digest = sha256_of(args.output)
+            print(f"[ok] SHA-256: {digest}")
+
+            if args.sha256:
+                if digest.lower() == args.sha256.lower():
+                    print("[ok] Hash confere — ISO íntegra.")
+                    return 0
+                print(
+                    f"[erro] Hash diverge!\n"
+                    f"       esperado: {args.sha256}\n"
+                    f"       obtido:   {digest}"
+                )
+                return 1
+
+            print("\n[i] Confira o SHA-256 no blog oficial antes de usar a ISO.")
             return 0
-        else:
-            print(
-                f"[erro] Hash diverge!\n"
-                f"       esperado: {args.sha256}\n"
-                f"       obtido:   {actual}"
-            )
-            return 1
 
-    print(
-        "\n[i] Dica: confira o SHA-256 no blog oficial do Windows Insider\n"
-        "    ou no site da Microsoft antes de usar a ISO."
-    )
-    return 0
+        except Exception as exc:
+            print(f"\n[erro] {exc}")
+            dump_debug(page, args.debug_dir, "fatal")
+            return 1
+        finally:
+            ctx.close()
 
 
 if __name__ == "__main__":
