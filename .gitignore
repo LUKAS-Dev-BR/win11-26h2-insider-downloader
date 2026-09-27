@@ -1,0 +1,36 @@
+# ISOs e binários grandes
+*.iso
+*.img
+*.vhdx
+*.wim
+
+# Cookies / credenciais — NUNCA commitar
+cookies.txt
+*.cookies
+ms_session/
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Logs
+*.log
+insider_page_debug.html
+download_report.txt
+
+# Git LFS staging area
+.lfs-tmp/
